@@ -20,69 +20,126 @@ torch::Tensor d_elu(torch::Tensor z, torch::Scalar alpha = 1.0) {
   return (z > 0).type_as(z) + mask.type_as(z) * (alpha * e);
 }
 
+#include <dlfcn.h>
+std::function<void(void*, size_t, void*)> compile(std::string filename, std::string function) {
+    char buffer [L_tmpnam];
+    tmpnam (buffer);
+    int res;
+    char data[1024];
+    sprintf(data, "clang++ %s -O3 -fno-exceptions -fno-vectorize -fno-slp-vectorize -ffast-math -fno-unroll-loops -Xclang -new-struct-path-tbaa -S -emit-llvm -o %s.ll", filename.c_str(), buffer);
+    printf("running compile - %s\n", data);
+    res = system(data);
+    printf("ran compile - %s\n", data);
+    assert(res == 0);
+
+    printf("making buffer 2\n");
+
+    char buffer2 [L_tmpnam];
+    printf("making tm buffer 2\n");
+    tmpnam (buffer2);
+    printf("made buffer 2\n");
+
+    sprintf(data, "clang++ -fPIC -shared %s.ll -o %s.so", buffer, buffer2);
+    printf("running library - %s\n", data);
+    res = system(data);
+    printf("ran library - %s\n", data);
+    assert(res == 0);
+
+    char buffer3[L_tmpnam];
+    sprintf(buffer3, "%s.so", buffer2);
+
+    printf("running dlopen\n");
+    void* lib = dlopen(buffer3, RTLD_LAZY);
+    assert(lib);
+    printf("running dlsym\n");
+    void* sym = dlsym(lib, function.c_str());
+    assert(sym);
+    auto f = (void(*)(void*, size_t, void*))sym;
+    return f;
+}
+
+std::function<void(void*, void*, size_t, void*)> diffecompile(std::string filename, std::string function) {
+    int res;
+
+    char buffer [L_tmpnam];
+    tmpnam (buffer);
+    char data[1024];
+    sprintf(data, "clang++ -O3 %s -DTF_ENZYME=1 -fno-exceptions -fno-vectorize -fno-slp-vectorize -ffast-math -fno-unroll-loops -Xclang -new-struct-path-tbaa -S -emit-llvm -o %s.ll", filename.c_str(), buffer);
+    printf("running compile - %s\n", data);
+    res = system(data);
+    printf("ran compile - %s\n", data);
+    assert(res == 0);
+
+    sprintf(data, "~/git/Enzyme/build/bin/opt %s.ll -load=%s -S -enzyme -mem2reg -instcombine -simplifycfg -adce -loop-deletion -simplifycfg -o %s.ll", buffer, "/home/wmoses/git/Enzyme/enzyme/build-dbg/Enzyme/LLVMEnzyme-7.so", buffer);
+    //sprintf(data, "~/git/Enzyme/build/bin/opt %s.ll -load=%s -S -enzyme -O3 -o %s.ll", buffer, "/home/wmoses/git/Enzyme/enzyme/build-dbg/Enzyme/LLVMEnzyme-7.so", buffer);
+    printf("running compile - %s\n", data);
+    res = system(data);
+    printf("ran compile - %s\n", data);
+    assert(res == 0);
+
+
+    printf("making buffer 2\n");
+
+    char buffer2 [L_tmpnam];
+    printf("making tm buffer 2\n");
+    tmpnam (buffer2);
+    printf("made buffer 2\n");
+
+    sprintf(data, "clang++ -fPIC -shared %s.ll -o %s.so", buffer, buffer2);
+    printf("running library - %s\n", data);
+    res = system(data);
+    printf("ran library - %s\n", data);
+    assert(res == 0);
+
+    char buffer3[L_tmpnam];
+    sprintf(buffer3, "%s.so", buffer2);
+
+    printf("running dlopen\n");
+    void* lib = dlopen(buffer3, RTLD_LAZY);
+    assert(lib);
+    std::string tofind = "diffe" + function;
+    printf("running dlsym %s\n", tofind.c_str());
+    void* sym = dlsym(lib, tofind.c_str());
+    assert(sym);
+    auto diffef = (void(*)(void*, void*, size_t, void*))sym;
+    return diffef;
+}
+
 std::vector<torch::Tensor> lltm_forward(
-    torch::Tensor input,
-    torch::Tensor weights,
-    torch::Tensor bias,
-    torch::Tensor old_h,
-    torch::Tensor old_cell) {
-  auto X = torch::cat({old_h, input}, /*dim=*/1);
+    torch::Tensor input, std::string filename, std::string function) {
 
-  auto gate_weights = torch::addmm(bias, X, weights.transpose(0, 1));
-  auto gates = gate_weights.chunk(3, /*dim=*/1);
+  if(!input.is_contiguous()) {
+    std::cout << "input not is_contiguous\n";
+  }
+  torch::Tensor result = at::empty(input.sizes(), input.options());
 
-  auto input_gate = torch::sigmoid(gates[0]);
-  auto output_gate = torch::sigmoid(gates[1]);
-  auto candidate_cell = torch::elu(gates[2], /*alpha=*/1.0);
 
-  auto new_cell = old_cell + candidate_cell * input_gate;
-  auto new_h = torch::tanh(new_cell) * output_gate;
+  auto f = compile(filename, function);
 
-  return {new_h,
-          new_cell,
-          input_gate,
-          output_gate,
-          candidate_cell,
-          X,
-          gate_weights};
+
+  f(input.data<float>(), input.numel(), result.data<float>());
+
+  return {result};
 }
 
 std::vector<torch::Tensor> lltm_backward(
-    torch::Tensor grad_h,
-    torch::Tensor grad_cell,
-    torch::Tensor new_cell,
-    torch::Tensor input_gate,
-    torch::Tensor output_gate,
-    torch::Tensor candidate_cell,
-    torch::Tensor X,
-    torch::Tensor gate_weights,
-    torch::Tensor weights) {
-  auto d_output_gate = torch::tanh(new_cell) * grad_h;
-  auto d_tanh_new_cell = output_gate * grad_h;
-  auto d_new_cell = d_tanh(new_cell) * d_tanh_new_cell + grad_cell;
+    torch::Tensor grad_out,
+    torch::Tensor input, std::string filename, std::string function) {
+  torch::Tensor inpp = at::empty(input.sizes(), input.options());
 
-  auto d_old_cell = d_new_cell;
-  auto d_candidate_cell = input_gate * d_new_cell;
-  auto d_input_gate = candidate_cell * d_new_cell;
+  if(!input.is_contiguous()) {
+    std::cout << "input not is_contiguous\n";
+  }
+  if(!grad_out.is_contiguous()) {
+    std::cout << "grad_out not is_contiguous\n";
+  }
+  auto df = diffecompile(filename, function);
 
-  auto gates = gate_weights.chunk(3, /*dim=*/1);
-  d_input_gate *= d_sigmoid(gates[0]);
-  d_output_gate *= d_sigmoid(gates[1]);
-  d_candidate_cell *= d_elu(gates[2]);
+  df(input.data<float>(), inpp.data<float>(), input.numel(), grad_out.data<float>());
 
-  auto d_gates =
-      torch::cat({d_input_gate, d_output_gate, d_candidate_cell}, /*dim=*/1);
-
-  auto d_weights = d_gates.t().mm(X);
-  auto d_bias = d_gates.sum(/*dim=*/0, /*keepdim=*/true);
-
-  auto d_X = d_gates.mm(weights);
-  const auto state_size = grad_h.size(1);
-  auto d_old_h = d_X.slice(/*dim=*/1, 0, state_size);
-  auto d_input = d_X.slice(/*dim=*/1, state_size);
-
-  return {d_old_h, d_input, d_weights, d_bias, d_old_cell};
+  return {inpp};
 }
+
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("forward", &lltm_forward, "LLTM forward");

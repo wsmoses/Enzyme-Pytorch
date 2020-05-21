@@ -8,37 +8,19 @@ import lltm_cpp
 torch.manual_seed(42)
 
 
-class LLTMFunction(Function):
-    @staticmethod
-    def forward(ctx, input, weights, bias, old_h, old_cell):
-        outputs = lltm_cpp.forward(input, weights, bias, old_h, old_cell)
-        new_h, new_cell = outputs[:2]
-        variables = outputs[1:] + [weights]
-        ctx.save_for_backward(*variables)
+def Enzyme(filename, function):
 
-        return new_h, new_cell
+    class anon(Function):
 
-    @staticmethod
-    def backward(ctx, grad_h, grad_cell):
-        d_old_h, d_input, d_weights, d_bias, d_old_cell = lltm_cpp.backward(
-            grad_h, grad_cell, *ctx.saved_variables)
-        return d_input, d_weights, d_bias, d_old_h, d_old_cell
+        @staticmethod
+        def forward(ctx, inp):
+            outputs = lltm_cpp.forward(inp.contiguous(), filename, function)
+            ctx.save_for_backward(inp)
+            return outputs[0]
 
+        @staticmethod
+        def backward(ctx, grad_out):
+            d_input = lltm_cpp.backward(grad_out.contiguous(), *ctx.saved_variables, filename, function)
+            return d_input[0]
 
-class LLTM(nn.Module):
-    def __init__(self, input_features, state_size):
-        super(LLTM, self).__init__()
-        self.input_features = input_features
-        self.state_size = state_size
-        self.weights = nn.Parameter(
-            torch.Tensor(3 * state_size, input_features + state_size))
-        self.bias = nn.Parameter(torch.Tensor(1, 3 * state_size))
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        stdv = 1.0 / math.sqrt(self.state_size)
-        for weight in self.parameters():
-            weight.data.uniform_(-stdv, +stdv)
-
-    def forward(self, input, state):
-        return LLTMFunction.apply(input, self.weights, self.bias, *state)
+    return anon
